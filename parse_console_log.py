@@ -215,12 +215,10 @@ if __name__ == '__main__':
             params = extract_test_params(test_lines)
             error_lines = extract_error_lines(filtered)
             results["failed_tests"].append({
-                "test_num": idx + 1,
                 "test_name": test_name,
                 "params": params,
                 "traceback": traceback,
                 "error_lines": "\n".join(error_lines),
-                "full_log": "\n".join(filtered)
             })
             print("Test #%d [FAIL] %s" % (idx + 1, test_name))
         elif status == "ABORT":
