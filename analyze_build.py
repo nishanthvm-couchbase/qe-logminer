@@ -74,7 +74,10 @@ def make_summary_doc(identity, build_id, failure, summary):
         "build_id": build_id,
         "test_name": failure.get("test_name", "unknown_test"),
         "params": failure.get("params", ""),
-        "error_lines": failure.get("error_lines", ""),
+        # error_lines is intentionally NOT stored: the summary is already distilled
+        # from it, Tier-2 reads only summaries, and full logs persist in S3 (linked
+        # from greenboard). We keep the compact traceback for human spot-checks.
+        "traceback": failure.get("traceback", ""),
         **summary,
     }
 

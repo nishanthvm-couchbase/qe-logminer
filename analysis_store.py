@@ -106,10 +106,11 @@ class AnalysisStore:
 
     def related_summaries(self, job_name: str, build: str) -> List[Dict[str, Any]]:
         """All Tier-1 summary docs for this (job, product-build), across reruns/build_ids."""
+        # `build` is a reserved word in N1QL → must be backticked.
         stmt = (
             f"SELECT a.* FROM `{ANALYSIS_BUCKET}` a "
             f"WHERE a.type = 'test_failure_analysis' "
-            f"AND a.job_name = $job AND a.build = $build"
+            f"AND a.job_name = $job AND a.`build` = $build"
         )
         return self._query(stmt, job=job_name, build=build)
 
@@ -117,7 +118,7 @@ class AnalysisStore:
         """Per-test failure records for this job across ALL builds (for first-seen /
         recurring / streak signals). Returns {test_name, build, build_id, category}."""
         stmt = (
-            f"SELECT a.test_name, a.build, a.build_id, a.category "
+            f"SELECT a.test_name, a.`build`, a.build_id, a.category "
             f"FROM `{ANALYSIS_BUCKET}` a "
             f"WHERE a.type = 'test_failure_analysis' AND a.job_name = $job "
             f"LIMIT {int(limit)}"
@@ -128,9 +129,9 @@ class AnalysisStore:
         """Job-level pass/fail per recent build from the server bucket (name = with-variants).
         Best-effort: needs a server-bucket index; returns [] if unavailable."""
         stmt = (
-            f"SELECT s.build, s.result, s.totalCount, s.failCount, s.build_id "
+            f"SELECT s.`build`, s.`result`, s.totalCount, s.failCount, s.build_id "
             f"FROM `{SERVER_BUCKET}` s "
             f"WHERE s.name = $name "
-            f"ORDER BY s.build DESC LIMIT {int(limit) * 4}"
+            f"ORDER BY s.`build` DESC LIMIT {int(limit) * 4}"
         )
         return self._query(stmt, name=name)
