@@ -1,0 +1,4 @@
+# Test Analysis pipeline dependencies.
+# (droid is a separate CLI installed on the machine — NOT a pip package.)
+requests>=2.28.0,<3
+couchbase==4.5.0
