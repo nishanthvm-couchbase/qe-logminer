@@ -180,6 +180,49 @@ def extract_traceback(test_lines):
     return "\n".join(tb_lines)
 
 
+def build_result(content, source="console", verbose=False):
+    """Parse raw consoleText into the structured result dict (the JSON shape).
+
+    Exposed as a function so the analysis pipeline can call it directly instead of
+    shelling out + reading a file.
+    """
+    tests = parse_tests(content)
+    results = {"source": source, "total_tests": len(tests),
+               "passed": 0, "failed": 0, "aborted": 0,
+               "failed_tests": []}
+
+    for idx, test_lines in enumerate(tests):
+        status = classify_test(test_lines)
+        test_name = extract_test_name(test_lines)
+
+        if status == "PASS":
+            results["passed"] += 1
+            if verbose:
+                print("Test #%d [PASS] %s" % (idx + 1, test_name))
+        elif status == "FAIL":
+            results["failed"] += 1
+            filtered = filter_log(test_lines)
+            traceback = extract_traceback(test_lines)
+            params = extract_test_params(test_lines)
+            error_lines = extract_error_lines(filtered)
+            results["failed_tests"].append({
+                "test_name": test_name,
+                "params": params,
+                "traceback": traceback,
+                "error_lines": "\n".join(error_lines),
+            })
+            if verbose:
+                print("Test #%d [FAIL] %s" % (idx + 1, test_name))
+        elif status == "ABORT":
+            results["aborted"] += 1
+            if verbose:
+                print("Test #%d [ABORT] %s" % (idx + 1, test_name))
+        elif verbose:
+            print("Test #%d [UNKNOWN] %s" % (idx + 1, test_name))
+
+    return results
+
+
 if __name__ == '__main__':
     if len(sys.argv) != 2:
         print("Usage: python3 parse_console_log.py <console_log_url_or_file>")
@@ -195,37 +238,7 @@ if __name__ == '__main__':
     print("=" * 80)
 
     content = fetch_content(source)
-    tests = parse_tests(content)
-
-    results = {"source": source, "total_tests": len(tests),
-               "passed": 0, "failed": 0, "aborted": 0,
-               "failed_tests": []}
-
-    for idx, test_lines in enumerate(tests):
-        status = classify_test(test_lines)
-        test_name = extract_test_name(test_lines)
-
-        if status == "PASS":
-            results["passed"] += 1
-            print("Test #%d [PASS] %s" % (idx + 1, test_name))
-        elif status == "FAIL":
-            results["failed"] += 1
-            filtered = filter_log(test_lines)
-            traceback = extract_traceback(test_lines)
-            params = extract_test_params(test_lines)
-            error_lines = extract_error_lines(filtered)
-            results["failed_tests"].append({
-                "test_name": test_name,
-                "params": params,
-                "traceback": traceback,
-                "error_lines": "\n".join(error_lines),
-            })
-            print("Test #%d [FAIL] %s" % (idx + 1, test_name))
-        elif status == "ABORT":
-            results["aborted"] += 1
-            print("Test #%d [ABORT] %s" % (idx + 1, test_name))
-        else:
-            print("Test #%d [UNKNOWN] %s" % (idx + 1, test_name))
+    results = build_result(content, source, verbose=True)
 
     # Build output filename
     if os.path.isfile(source):
