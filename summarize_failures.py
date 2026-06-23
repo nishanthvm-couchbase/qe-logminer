@@ -57,6 +57,12 @@ VALID_CATEGORIES = {
     "product_bug", "test_bug", "infra", "environment", "timeout", "unknown",
 }
 
+
+class DroidError(RuntimeError):
+    """Raised when a droid call fails (e.g. out of tokens, model blocked, timeout)
+    and we are NOT ignoring droid failures. Lets the orchestrator stop instead of
+    writing placeholder docs."""
+
 PROMPT_TEMPLATE = """\
 You are a Couchbase QE test-failure analyst. Below is ONE failed test from a \
 Jenkins test run: its name, input params, the Python traceback, and the \
@@ -201,8 +207,13 @@ def run_droid(prompt, model, auto="low"):
             os.unlink(tmp_path)
 
 
-def summarize_failure(failed_test, model):
-    """Run droid for one failed test and return the normalized summary dict."""
+def summarize_failure(failed_test, model, ignore_failure=False):
+    """Run droid for one failed test and return the normalized summary dict.
+
+    On droid failure: raise DroidError (default) so the caller can STOP — this
+    prevents writing placeholder docs and burning through a partial backfill once
+    droid is out of tokens. With ignore_failure=True, emit a placeholder instead.
+    """
     prompt = PROMPT_TEMPLATE.format(
         categories=sorted(VALID_CATEGORIES),
         test_name=failed_test.get("test_name", "unknown_test"),
@@ -212,15 +223,14 @@ def summarize_failure(failed_test, model):
     )
     ok, obj = run_droid(prompt, model)
     if not ok or obj is None:
-        # Never crash the pipeline on a single bad analysis — emit a placeholder
-        # doc so the failure is still recorded and can be re-analysed later.
-        return {
-            "summary": "(analysis unavailable — droid call failed)",
-            "category": "unknown",
-            "root_cause": "",
-            "suggested_fix": "",
-            "confidence": "low",
-        }
+        if ignore_failure:
+            return {
+                "summary": "(analysis unavailable — droid call failed)",
+                "category": "unknown", "root_cause": "",
+                "suggested_fix": "", "confidence": "low",
+            }
+        raise DroidError(
+            "droid summary failed for %s" % failed_test.get("test_name", "?"))
     return normalize_summary(obj)
 
 

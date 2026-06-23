@@ -18,7 +18,7 @@ import logging
 import re
 from typing import Any, Dict, List, Optional
 
-from summarize_failures import run_droid, extract_json_object
+from summarize_failures import run_droid, extract_json_object, DroidError
 
 logger = logging.getLogger(__name__)
 
@@ -196,13 +196,19 @@ def _normalize_synthesis(obj: Any) -> Dict[str, Any]:
 
 
 def synthesize(identity: Dict, stats: Dict, failures: List[Dict],
-               trend: List[Dict], existing: Optional[Dict], model: str) -> Dict[str, Any]:
-    if model and model != "__none__":
+               trend: List[Dict], existing: Optional[Dict], model: str,
+               ignore_failure: bool = False) -> Dict[str, Any]:
+    no_droid = not model or model == "__none__"   # --no-droid: intentional skip
+    if not no_droid:
         prompt = _synthesis_prompt(identity, stats, failures, trend, existing)
         ok, obj = run_droid(prompt, model)
     else:
         ok, obj = False, None
     if not ok or obj is None:
+        # A real droid failure (not the --no-droid skip) must stop unless ignored.
+        if not no_droid and not ignore_failure:
+            raise DroidError("droid analysis synthesis failed for %s"
+                             % identity.get("name", "?"))
         n_new = sum(1 for f in failures if f.get("is_new"))
         return {
             "headline": f"{stats['failed']} failed, {stats['aborted']} aborted "
@@ -222,6 +228,7 @@ def build_analysis_doc(
     identity: Dict, parse_result: Dict, summaries: List[Dict],
     history_records: List[Dict], trend_records: List[Dict],
     existing: Optional[Dict], model: str, now_iso: str,
+    ignore_failure: bool = False,
 ) -> Dict[str, Any]:
     failures = _dedupe_failures(summaries)
     hist = compute_history([f.get("test_name") for f in failures],
@@ -245,7 +252,7 @@ def build_analysis_doc(
 
     stats = compute_stats(parse_result, merged)
     trend = compute_trend(trend_records)
-    ai = synthesize(identity, stats, merged, trend, existing, model)
+    ai = synthesize(identity, stats, merged, trend, existing, model, ignore_failure)
 
     return {
         "type": "test_build_analysis",

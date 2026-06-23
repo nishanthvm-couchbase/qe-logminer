@@ -35,7 +35,7 @@ import requests
 
 from parse_console_log import fetch_content, build_result
 from job_identity import identity_from_actions
-from summarize_failures import summarize_failure
+from summarize_failures import summarize_failure, DroidError
 from build_analysis import build_analysis_doc
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -100,21 +100,31 @@ def main():
     ap.add_argument("--model", default=os.environ.get("DROID_MODEL", "deepseek-v4-pro"))
     ap.add_argument("--dry-run", action="store_true", help="no Couchbase writes/reads; print docs")
     ap.add_argument("--no-droid", action="store_true", help="skip droid (placeholder summaries)")
+    ap.add_argument("--ignore-droid-failure", action="store_true",
+                    help="on a droid failure, write a placeholder and continue instead of "
+                         "stopping (default: stop with a non-zero exit, write nothing)")
     args = ap.parse_args()
 
     # ---- acquire actions + console ----
     actions, build_id, console = None, args.build_id, None
-    if args.build_url:
-        logger.info("Fetching executor build %s", args.build_url)
-        actions, build_id, console = fetch_build(args.build_url)
-        source = args.build_url
-    else:
-        if not args.console_file:
-            ap.error("provide --build-url, or --console-file for offline mode")
-        console = fetch_content(args.console_file)
-        source = args.console_file
-        if args.actions_file:
-            actions = json.load(open(args.actions_file))
+    try:
+        if args.build_url:
+            logger.info("Fetching executor build %s", args.build_url)
+            actions, build_id, console = fetch_build(args.build_url)
+            source = args.build_url
+        else:
+            if not args.console_file:
+                ap.error("provide --build-url, or --console-file for offline mode")
+            console = fetch_content(args.console_file)
+            source = args.console_file
+            if args.actions_file:
+                actions = json.load(open(args.actions_file))
+    except Exception as exc:
+        # Console/log unavailable (e.g. Jenkins purged it AND the S3 copy is missing).
+        # Exit cleanly rather than crash — backfill treats this run as "nothing to do".
+        logger.warning("Could not fetch build/console (%s): %s — skipping.",
+                       args.build_url or args.console_file, exc)
+        return 0
 
     # ---- identity ----
     if args.name and args.build and args.os and args.component:
@@ -150,37 +160,45 @@ def main():
         store = AnalysisStore(args.cb_host, args.cb_user, args.cb_pass)
         logger.info("Connected to test_analysis @ %s", args.cb_host)
 
-    # ---- Tier 1: per-failure summary docs ----
     from analysis_store import key_summary, key_analysis
-    summary_docs = []
-    for i, failure in enumerate(failures, 1):
-        tname = failure.get("test_name", "unknown_test")
-        logger.info("  [summary %d/%d] %s", i, len(failures), tname)
-        summ = PLACEHOLDER_SUMMARY if args.no_droid else summarize_failure(failure, args.model)
-        doc = make_summary_doc(identity, build_id, failure, summ)
-        summary_docs.append(doc)
+    try:
+        # ---- Tier 1: per-failure summary docs ----
+        summary_docs = []
+        for i, failure in enumerate(failures, 1):
+            tname = failure.get("test_name", "unknown_test")
+            logger.info("  [summary %d/%d] %s", i, len(failures), tname)
+            summ = (PLACEHOLDER_SUMMARY if args.no_droid
+                    else summarize_failure(failure, args.model, args.ignore_droid_failure))
+            doc = make_summary_doc(identity, build_id, failure, summ)
+            summary_docs.append(doc)
+            if store:
+                store.upsert_summary(key_summary(identity["name"], build_id, tname), doc)
+
+        # ---- gather context for Tier 2 ----
+        related, history, trend, existing = list(summary_docs), [], [], None
         if store:
-            store.upsert_summary(key_summary(identity["name"], build_id, tname), doc)
+            # prior reruns of this product-build + cross-build history + trend + existing doc
+            related = store.related_summaries(identity["name"], identity["build"]) or summary_docs
+            history = store.test_failure_history(identity["name"])
+            trend   = store.job_trend(identity["name"])
+            existing = store.get_analysis(
+                key_analysis(identity["os"], identity["component"], identity["name"], identity["build"]))
+        # ensure the just-computed summaries are represented even before they're queryable
+        seen = {(d.get("test_name"), d.get("build_id")) for d in related}
+        related += [d for d in summary_docs if (d.get("test_name"), d.get("build_id")) not in seen]
 
-    # ---- gather context for Tier 2 ----
-    related, history, trend, existing = list(summary_docs), [], [], None
-    if store:
-        # prior reruns of this product-build + cross-build history + job trend + existing doc
-        related = store.related_summaries(identity["name"], identity["build"]) or summary_docs
-        history = store.test_failure_history(identity["name"])
-        trend   = store.job_trend(identity["name"])
-        existing = store.get_analysis(
-            key_analysis(identity["os"], identity["component"], identity["name"], identity["build"]))
-    # ensure the just-computed summaries are represented even before they're queryable
-    seen = {(d.get("test_name"), d.get("build_id")) for d in related}
-    related += [d for d in summary_docs if (d.get("test_name"), d.get("build_id")) not in seen]
-
-    # ---- Tier 2: analysis doc ----
-    now_iso = datetime.now(timezone.utc).isoformat()
-    analysis = build_analysis_doc(
-        identity, parse_result, related, history, trend, existing,
-        ("__none__" if args.no_droid else args.model), now_iso,
-    )
+        # ---- Tier 2: analysis doc ----
+        now_iso = datetime.now(timezone.utc).isoformat()
+        analysis = build_analysis_doc(
+            identity, parse_result, related, history, trend, existing,
+            ("__none__" if args.no_droid else args.model), now_iso,
+            ignore_failure=args.ignore_droid_failure,
+        )
+    except DroidError as exc:
+        logger.error("Droid failure (likely out of tokens): %s. STOPPING — no analysis doc "
+                     "written for this run. Restore tokens, then re-run with --skip-existing "
+                     "(this job will be redone; completed jobs are skipped).", exc)
+        return 3
     akey = key_analysis(identity["os"], identity["component"], identity["name"], identity["build"])
     if store:
         store.upsert_analysis(akey, analysis)

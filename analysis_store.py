@@ -125,6 +125,26 @@ class AnalysisStore:
         )
         return self._query(stmt, job=job_name)
 
+    # --- greenboard reads (used by the backfill tool) ---
+
+    def list_version_builds(self, version: str) -> List[str]:
+        """All product builds of a version that have a greenboard build doc.
+        Returns build strings like '8.1.0-2299' (caller sorts/limits)."""
+        stmt = (
+            "SELECT RAW META().id FROM `greenboard` "
+            "WHERE META().id LIKE $pat"
+        )
+        ids = self._query(stmt, pat=f"{version}-%_server")
+        out = []
+        for i in ids:
+            if isinstance(i, str) and i.endswith("_server"):
+                out.append(i[: -len("_server")])
+        return out
+
+    def get_build_doc(self, build: str) -> Optional[Dict[str, Any]]:
+        """The nested greenboard build doc `{build}_server` (os→comp→job→[runs])."""
+        return self.get("greenboard", f"{build}_server")
+
     def job_trend(self, name: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Job-level pass/fail per recent build from the server bucket (name = with-variants).
         Best-effort: needs a server-bucket index; returns [] if unavailable."""
