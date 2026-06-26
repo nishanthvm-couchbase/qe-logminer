@@ -182,7 +182,7 @@ def main():
             history = store.test_failure_history(identity["name"])
             trend   = store.job_trend(identity["name"])
             existing = store.get_analysis(
-                key_analysis(identity["os"], identity["component"], identity["name"], identity["build"]))
+                key_analysis(identity["name"], identity["build"]))
         # ensure the just-computed summaries are represented even before they're queryable
         seen = {(d.get("test_name"), d.get("build_id")) for d in related}
         related += [d for d in summary_docs if (d.get("test_name"), d.get("build_id")) not in seen]
@@ -199,7 +199,7 @@ def main():
                      "written for this run. Restore tokens, then re-run with --skip-existing "
                      "(this job will be redone; completed jobs are skipped).", exc)
         return 3
-    akey = key_analysis(identity["os"], identity["component"], identity["name"], identity["build"])
+    akey = key_analysis(identity["name"], identity["build"])
     if store:
         store.upsert_analysis(akey, analysis)
         logger.info("Upserted analysis doc %s (verdict=%s, %d failures)",

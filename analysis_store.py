@@ -36,8 +36,12 @@ def key_summary(job_name: str, build_id: Any, test_name: str) -> str:
     return "tfa_" + hashlib.md5(f"{job_name}-{build_id}-{test_name}".encode()).hexdigest()
 
 
-def key_analysis(os_name: str, component: str, name: str, build: str) -> str:
-    raw = f"{os_name}|{component}|{name}|{build}"
+def key_analysis(name: str, build: str) -> str:
+    # `name` is the greenboard name-WITH-variants — already globally unique (it encodes
+    # os + component + subcomponent + variants). Keying on (name, build) makes the
+    # analysis doc independent of how greenboard LABELS the component (gb_label), so the
+    # Test Analysis button resolves it regardless of display relabeling.
+    raw = f"{name}|{build}"
     return "analysis_" + hashlib.md5(raw.encode()).hexdigest()
 
 
