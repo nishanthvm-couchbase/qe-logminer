@@ -105,6 +105,14 @@ def main():
                          "stopping (default: stop with a non-zero exit, write nothing)")
     args = ap.parse_args()
 
+    # ---- token-usage tracking (per droid call → JSONL + CB token_usage docs) ----
+    try:
+        import token_usage
+        token_usage.configure(cb_host=(None if args.dry_run else args.cb_host),
+                              cb_user=args.cb_user, cb_pass=args.cb_pass)
+    except Exception:
+        pass
+
     # ---- acquire actions + console ----
     actions, build_id, console = None, args.build_id, None
     try:
@@ -168,7 +176,11 @@ def main():
             tname = failure.get("test_name", "unknown_test")
             logger.info("  [summary %d/%d] %s", i, len(failures), tname)
             summ = (PLACEHOLDER_SUMMARY if args.no_droid
-                    else summarize_failure(failure, args.model, args.ignore_droid_failure))
+                    else summarize_failure(failure, args.model, args.ignore_droid_failure, meta={
+                        "name": identity["name"], "os": identity["os"],
+                        "component": identity["component"], "build": identity["build"],
+                        "build_id": build_id,
+                    }))
             doc = make_summary_doc(identity, build_id, failure, summ)
             summary_docs.append(doc)
             if store:

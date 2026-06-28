@@ -201,7 +201,11 @@ def synthesize(identity: Dict, stats: Dict, failures: List[Dict],
     no_droid = not model or model == "__none__"   # --no-droid: intentional skip
     if not no_droid:
         prompt = _synthesis_prompt(identity, stats, failures, trend, existing)
-        ok, obj = run_droid(prompt, model)
+        ok, obj = run_droid(prompt, model, meta={
+            "phase": "analysis", "name": identity.get("name"),
+            "os": identity.get("os"), "component": identity.get("component"),
+            "build": identity.get("build"),
+        })
     else:
         ok, obj = False, None
     if not ok or obj is None:

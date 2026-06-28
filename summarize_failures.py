@@ -175,44 +175,77 @@ def normalize_summary(obj):
     }
 
 
-def run_droid(prompt, model, auto="low"):
-    """Invoke `droid exec` headless on a prompt file; return (ok, parsed_or_None)."""
+def run_droid(prompt, model, auto="low", meta=None):
+    """Invoke `droid exec` headless on a prompt file; return (ok, parsed_or_None).
+
+    Uses --output-format json so we get a structured envelope:
+      { type, is_error, duration_ms, session_id, result, usage:{input_tokens,...} }
+    The model's answer is in `result`; exact token usage is in `usage`. We record
+    one token-usage event per call (best-effort, never raises). `meta` carries the
+    job context (phase, name, os, component, build, build_id, test_name).
+    """
     tmp_path = None
+    usage = session_id = duration_ms = None
+    ok = False
+    obj = None
     try:
         with tempfile.NamedTemporaryFile(
             "w", suffix=".txt", delete=False, encoding="utf-8"
         ) as tf:
             tf.write(prompt)
             tmp_path = tf.name
-        cmd = [DROID_BIN, "exec", "-f", tmp_path, "--model", model, "--auto", auto]
+        cmd = [DROID_BIN, "exec", "-f", tmp_path, "--model", model,
+               "--auto", auto, "--output-format", "json"]
         proc = subprocess.run(
             cmd, capture_output=True, text=True, timeout=DROID_TIMEOUT
         )
-        if proc.returncode != 0:
-            sys.stderr.write(
-                "  droid exited %d: %s\n" % (proc.returncode, proc.stderr.strip()[:400])
-            )
-            return False, None
-        return True, extract_json_object(proc.stdout)
+        envelope = None
+        try:
+            envelope = json.loads(proc.stdout)
+        except Exception:
+            envelope = None
+
+        if isinstance(envelope, dict):
+            usage       = envelope.get("usage")
+            session_id  = envelope.get("session_id")
+            duration_ms = envelope.get("duration_ms")
+            is_error    = bool(envelope.get("is_error", proc.returncode != 0))
+            ok          = (proc.returncode == 0) and not is_error
+            obj         = extract_json_object(envelope.get("result") or "") if ok else None
+            if not ok:
+                sys.stderr.write("  droid error: %s\n"
+                                 % (str(envelope.get("result", ""))[:300] or proc.stderr.strip()[:300]))
+        else:
+            # Fallback: not JSON (older droid / unexpected) — treat stdout as the answer.
+            ok  = proc.returncode == 0
+            obj = extract_json_object(proc.stdout) if ok else None
+            if not ok:
+                sys.stderr.write("  droid exited %d: %s\n" % (proc.returncode, proc.stderr.strip()[:400]))
+        return ok, obj
     except subprocess.TimeoutExpired:
         sys.stderr.write("  droid timed out after %ds\n" % DROID_TIMEOUT)
         return False, None
     except FileNotFoundError:
-        sys.stderr.write(
-            "  droid binary not found (set DROID_BIN or add to PATH)\n"
-        )
+        sys.stderr.write("  droid binary not found (set DROID_BIN or add to PATH)\n")
         return False, None
     finally:
+        try:
+            import token_usage
+            token_usage.record({**(meta or {}), "model": model}, usage, duration_ms, session_id, ok)
+        except Exception:
+            pass
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
 
-def summarize_failure(failed_test, model, ignore_failure=False):
+def summarize_failure(failed_test, model, ignore_failure=False, meta=None):
     """Run droid for one failed test and return the normalized summary dict.
 
     On droid failure: raise DroidError (default) so the caller can STOP — this
     prevents writing placeholder docs and burning through a partial backfill once
     droid is out of tokens. With ignore_failure=True, emit a placeholder instead.
+
+    `meta` (job/os/component/build context) is forwarded for token-usage tracking.
     """
     prompt = PROMPT_TEMPLATE.format(
         categories=sorted(VALID_CATEGORIES),
@@ -221,7 +254,9 @@ def summarize_failure(failed_test, model, ignore_failure=False):
         traceback=failed_test.get("traceback", "") or "(no traceback captured)",
         error_lines=failed_test.get("error_lines", "") or "(no error lines captured)",
     )
-    ok, obj = run_droid(prompt, model)
+    call_meta = {**(meta or {}), "phase": "summarize",
+                 "test_name": failed_test.get("test_name", "unknown_test")}
+    ok, obj = run_droid(prompt, model, meta=call_meta)
     if not ok or obj is None:
         if ignore_failure:
             return {
@@ -248,7 +283,10 @@ def build_analysis_docs(parse_result, meta, model):
         sys.stderr.write(
             "  [%d/%d] summarizing: %s\n" % (idx + 1, len(failed), test_name)
         )
-        summary = summarize_failure(ft, model)
+        summary = summarize_failure(ft, model, meta={
+            "name": job_name, "build_id": build_id, "build": meta.get("build"),
+            "os": meta.get("os"), "component": meta.get("component"),
+        })
         doc = {
             "type": "test_failure_analysis",
             "schema_version": 1,
