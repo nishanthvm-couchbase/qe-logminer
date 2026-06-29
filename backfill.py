@@ -124,6 +124,72 @@ class Jenkins:
             raise RuntimeError(f"trigger HTTP {r.status_code}: {r.text[:200]}")
         return r.headers.get("Location")     # .../queue/item/<id>/
 
+    def run_window(self, items, params_fn, max_concurrent: int, poll: int,
+                   stop_on_failure: bool = True):
+        """Dispatch `items` keeping at most `max_concurrent` builds in flight.
+
+        Each item flows: trigger -> resolve queue item to a build URL -> wait for
+        completion. The instant a slot frees, the next item is triggered — so the
+        Jenkins queue never holds more than `max_concurrent` of ours at a time.
+        Returns (results, aborted). aborted=True if we stopped early on a FAILURE.
+        """
+        pending   = list(items)     # not yet triggered
+        resolving = {}              # queue_url -> tries  (waiting for a build number)
+        building  = {}              # queue_url -> build_url (running)
+        results   = []
+        aborted   = False
+        MAX_RESOLVE = 90
+
+        def slots():
+            return max_concurrent - len(resolving) - len(building)
+
+        while pending or resolving or building:
+            # 1) fill free slots with new triggers (stop pulling new work if aborting)
+            while not aborted and pending and slots() > 0:
+                it = pending.pop(0)
+                try:
+                    qu = self.trigger(params_fn(it))
+                    if qu:
+                        resolving[qu] = 0
+                    else:
+                        results.append("UNKNOWN")
+                except Exception as exc:
+                    logger.warning("  trigger failed for %s/%s: %s",
+                                   it.get("component"), it.get("name"), exc)
+                    results.append("UNKNOWN")
+            # 2) resolve queue items -> build URLs
+            for qu, tries in list(resolving.items()):
+                try:
+                    d = self.s.get(qu.rstrip('/') + "/api/json", timeout=15).json()
+                except Exception:
+                    d = None
+                if d and d.get("cancelled"):
+                    results.append("CANCELLED"); del resolving[qu]
+                elif d and d.get("executable"):
+                    building[qu] = d["executable"]["url"]; del resolving[qu]
+                elif tries + 1 >= MAX_RESOLVE:
+                    logger.warning("  gave up resolving %s", qu)
+                    results.append("UNKNOWN"); del resolving[qu]
+                else:
+                    resolving[qu] = tries + 1
+            # 3) poll running builds for completion
+            for qu, burl in list(building.items()):
+                try:
+                    d = self.s.get(burl.rstrip('/') + "/api/json",
+                                   params={"tree": "building,result"}, timeout=15).json()
+                except Exception:
+                    d = None
+                if d and not d.get("building") and d.get("result"):
+                    res = d["result"]; results.append(res); del building[qu]
+                    if stop_on_failure and res == "FAILURE":
+                        aborted = True
+            if pending or resolving or building:
+                logger.info("  in-flight: %d running, %d resolving, %d queued, %d done%s",
+                            len(building), len(resolving), len(pending), len(results),
+                            "  (aborting — draining)" if aborted else "")
+                time.sleep(poll)
+        return results, aborted
+
     def wait_batch(self, queue_urls, poll: int):
         """Wait for every triggered build to finish; return the list of results
         ('SUCCESS' / 'FAILURE' / 'CANCELLED' / 'UNKNOWN'). FAILURE = analyze_build
@@ -182,6 +248,10 @@ def main():
                          "failed batch — usually droid out of tokens — so you can resume with "
                          "--skip-existing after restoring tokens)")
     ap.add_argument("--poll-interval", type=int, default=20)
+    ap.add_argument("--max-concurrent", type=int, default=30,
+                    help="max analysis builds in flight at once (sliding window). The script "
+                         "keeps this many running and triggers the next as each finishes, so "
+                         "the Jenkins queue never floods (default 30)")
     # couchbase
     ap.add_argument("--cb-host", default=os.environ.get("CB_HOST", "172.23.105.219"))
     ap.add_argument("--cb-user", default=os.environ.get("CB_USER", "Administrator"))
@@ -252,27 +322,26 @@ def main():
                 logger.info("    … +%d more", len(runs) - 5)
             continue
 
-        queue_urls = []
-        for r in runs:
-            params = {
+        def _params(r):
+            return {
                 "CONSOLE_URL": r["console_url"], "OS": r["os"],
                 "COMPONENT": r["component"], "NAME": r["name"],
                 "DISPLAY_NAME": r["display_name"], "BUILD": r["build"],
                 "BUILD_ID": str(r["build_id"]),
                 "IGNORE_DROID_FAILURE": "1" if args.ignore_droid_failure else "0",
             }
-            try:
-                queue_urls.append(jenkins.trigger(params))
-            except Exception as exc:
-                logger.warning("  trigger failed for %s/%s: %s", r["component"], r["name"], exc)
 
-        logger.info("Build %s: dispatched %d — waiting for the batch to finish…", build, len(queue_urls))
-        results = jenkins.wait_batch(queue_urls, args.poll_interval)
+        logger.info("Build %s: dispatching %d run(s), max %d in flight…",
+                    build, len(runs), args.max_concurrent)
+        results, aborted = jenkins.run_window(
+            runs, _params, args.max_concurrent, args.poll_interval,
+            stop_on_failure=not args.ignore_droid_failure)
         failed = sum(1 for x in results if x == "FAILURE")
-        logger.info("Build %s: %d done, %d FAILURE, %d other",
-                    build, len(results), failed, len(results) - failed - results.count("SUCCESS"))
+        logger.info("Build %s: %d done, %d FAILURE, %d SUCCESS, %d other",
+                    build, len(results), failed, results.count("SUCCESS"),
+                    len(results) - failed - results.count("SUCCESS"))
 
-        if failed and not args.ignore_droid_failure:
+        if aborted or failed and not args.ignore_droid_failure:
             logger.error("%d run(s) FAILED in build %s — almost certainly droid out of tokens. "
                          "STOPPING the backfill. Restore tokens, then re-run the SAME command with "
                          "--skip-existing to resume (completed jobs are skipped).", failed, build)

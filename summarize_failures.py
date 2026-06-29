@@ -45,6 +45,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 # droid exec defaults. "deepseek-v4-pro" is the org-permitted "Droid Core" model
 # (droid's own default claude-opus-* is blocked by org policy here). Override with
@@ -52,6 +53,16 @@ import tempfile
 DROID_BIN = os.environ.get("DROID_BIN", "droid")
 DEFAULT_MODEL = os.environ.get("DROID_MODEL", "deepseek-v4-pro")
 DROID_TIMEOUT = int(os.environ.get("DROID_TIMEOUT", "180"))  # seconds per failure
+# A single droid call can fail transiently under concurrent load (backend
+# rate-limit / overload / brief 5xx). Retry those with exponential backoff
+# instead of aborting the whole job. Genuinely fatal errors (auth, bad model,
+# quota) are detected and NOT retried.
+DROID_RETRIES = int(os.environ.get("DROID_RETRIES", "3"))            # extra attempts after the first
+DROID_RETRY_BACKOFF = float(os.environ.get("DROID_RETRY_BACKOFF", "8"))  # base secs, doubles each retry
+_FATAL_DROID = re.compile(
+    r"not logged in|unauthor|forbidden|invalid api key|invalid.*token|"
+    r"quota exceeded|no such model|unknown model|model .*not (found|available)|"
+    r"insufficient (funds|credit|quota)", re.I)
 
 VALID_CATEGORIES = {
     "product_bug", "test_bug", "infra", "environment", "timeout", "unknown",
@@ -175,19 +186,19 @@ def normalize_summary(obj):
     }
 
 
-def run_droid(prompt, model, auto="low", meta=None):
-    """Invoke `droid exec` headless on a prompt file; return (ok, parsed_or_None).
+def _run_droid_once(prompt, model, auto, meta):
+    """One `droid exec` invocation; return (ok, parsed_or_None, err_text).
 
     Uses --output-format json so we get a structured envelope:
       { type, is_error, duration_ms, session_id, result, usage:{input_tokens,...} }
     The model's answer is in `result`; exact token usage is in `usage`. We record
-    one token-usage event per call (best-effort, never raises). `meta` carries the
-    job context (phase, name, os, component, build, build_id, test_name).
+    one token-usage event per attempt (best-effort, never raises).
     """
     tmp_path = None
     usage = session_id = duration_ms = None
     ok = False
     obj = None
+    err = ""
     try:
         with tempfile.NamedTemporaryFile(
             "w", suffix=".txt", delete=False, encoding="utf-8"
@@ -213,21 +224,22 @@ def run_droid(prompt, model, auto="low", meta=None):
             ok          = (proc.returncode == 0) and not is_error
             obj         = extract_json_object(envelope.get("result") or "") if ok else None
             if not ok:
-                sys.stderr.write("  droid error: %s\n"
-                                 % (str(envelope.get("result", ""))[:300] or proc.stderr.strip()[:300]))
+                err = str(envelope.get("result", "")) or proc.stderr.strip()
+                sys.stderr.write("  droid error: %s\n" % err[:300])
         else:
             # Fallback: not JSON (older droid / unexpected) — treat stdout as the answer.
             ok  = proc.returncode == 0
             obj = extract_json_object(proc.stdout) if ok else None
             if not ok:
-                sys.stderr.write("  droid exited %d: %s\n" % (proc.returncode, proc.stderr.strip()[:400]))
-        return ok, obj
+                err = proc.stderr.strip()
+                sys.stderr.write("  droid exited %d: %s\n" % (proc.returncode, err[:400]))
+        return ok, obj, err
     except subprocess.TimeoutExpired:
         sys.stderr.write("  droid timed out after %ds\n" % DROID_TIMEOUT)
-        return False, None
+        return False, None, "timeout"
     except FileNotFoundError:
         sys.stderr.write("  droid binary not found (set DROID_BIN or add to PATH)\n")
-        return False, None
+        return False, None, "binary not found"
     finally:
         try:
             import token_usage
@@ -236,6 +248,29 @@ def run_droid(prompt, model, auto="low", meta=None):
             pass
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
+
+
+def run_droid(prompt, model, auto="low", meta=None):
+    """Invoke droid with bounded retry/backoff; return (ok, parsed_or_None).
+
+    Transient failures (rate-limit / overload / 5xx / timeout) are retried up to
+    DROID_RETRIES times with exponential backoff so one bad call doesn't abort the
+    whole job. Clearly fatal errors (auth, bad model, quota) are NOT retried —
+    they'll still surface fast so the fail-fast path can stop the backfill.
+    """
+    for attempt in range(DROID_RETRIES + 1):
+        ok, obj, err = _run_droid_once(prompt, model, auto, meta)
+        if ok:
+            return True, obj
+        if err and _FATAL_DROID.search(err):
+            sys.stderr.write("  droid error looks fatal — not retrying\n")
+            break
+        if attempt < DROID_RETRIES:
+            wait = DROID_RETRY_BACKOFF * (2 ** attempt)
+            sys.stderr.write("  droid attempt %d/%d failed (transient) — retrying in %.0fs\n"
+                             % (attempt + 1, DROID_RETRIES + 1, wait))
+            time.sleep(wait)
+    return False, None
 
 
 def summarize_failure(failed_test, model, ignore_failure=False, meta=None):
