@@ -143,7 +143,10 @@ class Jenkins:
         def slots():
             return max_concurrent - len(resolving) - len(building)
 
-        while pending or resolving or building:
+        # Loop while there's in-flight work, OR queued work we're still allowed to
+        # dispatch. Once aborted we stop pulling from `pending`, so it must NOT keep
+        # the loop alive — otherwise we spin forever on a full queue (0 in-flight).
+        while resolving or building or (pending and not aborted):
             # 1) fill free slots with new triggers (stop pulling new work if aborting)
             while not aborted and pending and slots() > 0:
                 it = pending.pop(0)
@@ -183,11 +186,14 @@ class Jenkins:
                     res = d["result"]; results.append(res); del building[qu]
                     if stop_on_failure and res == "FAILURE":
                         aborted = True
-            if pending or resolving or building:
+            if resolving or building or (pending and not aborted):
                 logger.info("  in-flight: %d running, %d resolving, %d queued, %d done%s",
                             len(building), len(resolving), len(pending), len(results),
                             "  (aborting — draining)" if aborted else "")
                 time.sleep(poll)
+        if aborted and pending:
+            logger.warning("Aborted with %d run(s) never dispatched — re-run with "
+                           "--skip-existing to resume them.", len(pending))
         return results, aborted
 
     def wait_batch(self, queue_urls, poll: int):
