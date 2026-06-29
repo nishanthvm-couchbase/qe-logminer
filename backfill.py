@@ -226,7 +226,7 @@ def main():
                 jk = (r["os"], r["component"], r["name"])
                 if jk not in checked:
                     checked[jk] = store.get_analysis(
-                        key_analysis(r["os"], r["component"], r["name"], build)) is not None
+                        key_analysis(r["name"], build)) is not None
                 if checked[jk]:
                     done.add(jk)
                 else:
