@@ -64,6 +64,48 @@ _FATAL_DROID = re.compile(
     r"quota exceeded|no such model|unknown model|model .*not (found|available)|"
     r"insufficient (funds|credit|quota)", re.I)
 
+# Volatile tokens that differ between otherwise-identical failure instances
+# (a retried test logs new timestamps/IPs/pids each run). Stripped before hashing
+# so true repeats collapse to one signature.
+_VOLATILE = [
+    re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}[,\.]?\d*"),  # ISO timestamps
+    re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b"),                      # IPv4
+    re.compile(r"0x[0-9a-fA-F]+"),                                   # hex addresses
+    re.compile(r":\d{2,5}\b"),                                       # ports
+    re.compile(r"\b\d{6,}\b"),                                       # long ints (epoch ms, pids)
+]
+
+
+def _normalize(s):
+    """Strip volatile tokens (timestamps, IPs, ports, pids, big counts) and
+    collapse whitespace, so true repeats of a failure normalize to the same text."""
+    s = s or ""
+    for rx in _VOLATILE:
+        s = rx.sub("·", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def failure_signature(failure):
+    """Stable hash identifying a *distinct* failure.
+
+    Basis: test_name + params + the normalized TRACEBACK (exception type, the
+    file:line frames, and the message). The traceback is what's actually stable
+    across retries of the same failure — the surrounding `error_lines` log window
+    is not (it carries per-run durations, counts, vbucket maps, etc.), so it must
+    NOT be part of the key. Consequences:
+      • same test, same params, same exception/trace  -> same sig -> ONE droid call
+      • different params                               -> different sig -> own call
+      • a genuinely different error/exception          -> different trace -> own call
+    Falls back to the normalized error window only when no traceback was captured.
+    """
+    tn = (failure.get("test_name") or "").strip()
+    params = _normalize(failure.get("params") or "")
+    tb = _normalize(failure.get("traceback") or "")
+    if not tb:                                   # no traceback parsed — best-effort fallback
+        tb = _normalize(failure.get("error_lines") or "")[:4000]
+    raw = tn + "||" + params + "||" + tb
+    return hashlib.md5(raw.encode("utf-8", "ignore")).hexdigest()
+
 VALID_CATEGORIES = {
     "product_bug", "test_bug", "infra", "environment", "timeout", "unknown",
 }

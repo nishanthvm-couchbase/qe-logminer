@@ -44,14 +44,17 @@ def build_sort_key(build: str):
 
 
 def _dedupe_failures(summaries: List[Dict]) -> List[Dict]:
-    """One row per test_name (keep the newest build_id's summary)."""
-    by_test: Dict[str, Dict] = {}
+    """One row per DISTINCT failure — keyed (test_name, sig) so a method that failed
+    with several different params/errors keeps a row each. A true rerun of the SAME
+    failure (same test_name + sig across build_ids) collapses to the newest one.
+    Falls back to test_name alone for legacy docs with no sig."""
+    by_key: Dict[Any, Dict] = {}
     for s in summaries:
-        t = s.get("test_name", "?")
-        cur = by_test.get(t)
+        k = (s.get("test_name", "?"), s.get("sig") or "")
+        cur = by_key.get(k)
         if cur is None or str(s.get("build_id", "")) > str(cur.get("build_id", "")):
-            by_test[t] = s
-    return list(by_test.values())
+            by_key[k] = s
+    return list(by_key.values())
 
 
 def compute_stats(parse_result: Dict, failures: List[Dict]) -> Dict[str, Any]:

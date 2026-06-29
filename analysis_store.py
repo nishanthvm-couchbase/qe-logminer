@@ -32,8 +32,14 @@ SERVER_BUCKET   = "server"
 # Keys
 # ---------------------------------------------------------------------------
 
-def key_summary(job_name: str, build_id: Any, test_name: str) -> str:
-    return "tfa_" + hashlib.md5(f"{job_name}-{build_id}-{test_name}".encode()).hexdigest()
+def key_summary(job_name: str, build_id: Any, test_name: str, sig: str = None) -> str:
+    # `sig` distinguishes distinct failures that share a test_name (same method,
+    # different params or a different error). Without it, parametrized failures of
+    # one method collide on this key and overwrite each other.
+    base = f"{job_name}-{build_id}-{test_name}"
+    if sig:
+        base += f"-{sig}"
+    return "tfa_" + hashlib.md5(base.encode()).hexdigest()
 
 
 def key_analysis(name: str, build: str) -> str:

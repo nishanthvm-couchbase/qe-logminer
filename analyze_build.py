@@ -35,7 +35,7 @@ import requests
 
 from parse_console_log import fetch_content, build_result
 from job_identity import identity_from_actions
-from summarize_failures import summarize_failure, DroidError
+from summarize_failures import summarize_failure, failure_signature, DroidError
 from build_analysis import build_analysis_doc
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -62,7 +62,7 @@ def fetch_build(build_url: str):
     return data.get("actions"), data.get("number"), console
 
 
-def make_summary_doc(identity, build_id, failure, summary):
+def make_summary_doc(identity, build_id, failure, summary, sig=None):
     return {
         "type": "test_failure_analysis",
         "schema_version": 1,
@@ -73,6 +73,9 @@ def make_summary_doc(identity, build_id, failure, summary):
         "build": identity["build"],
         "build_id": build_id,
         "test_name": failure.get("test_name", "unknown_test"),
+        # signature distinguishing this failure from same-named ones with different
+        # params/error — so distinct parametrized failures are kept separate.
+        "sig": sig,
         "params": failure.get("params", ""),
         # error_lines is intentionally NOT stored: the summary is already distilled
         # from it, Tier-2 reads only summaries, and full logs persist in S3 (linked
@@ -171,20 +174,40 @@ def main():
     from analysis_store import key_summary, key_analysis
     try:
         # ---- Tier 1: per-failure summary docs ----
+        # Dedup droid CALLS by failure signature: identical failures (same test +
+        # params + error shape, timestamps/IPs/pids normalized out) are summarized
+        # ONCE and the result reused. Genuinely different failures (different params
+        # or a different error) have a different signature and get their own call.
+        # Every failure still produces a doc, so stored docs / related / Tier-2 stats
+        # are byte-identical to summarizing each one separately — only the droid
+        # spend drops (e.g. 16 calls -> 3 when a test was retried 7x and 8x).
         summary_docs = []
+        sig_cache = {}
+        n_calls = 0
         for i, failure in enumerate(failures, 1):
             tname = failure.get("test_name", "unknown_test")
-            logger.info("  [summary %d/%d] %s", i, len(failures), tname)
-            summ = (PLACEHOLDER_SUMMARY if args.no_droid
-                    else summarize_failure(failure, args.model, args.ignore_droid_failure, meta={
-                        "name": identity["name"], "os": identity["os"],
-                        "component": identity["component"], "build": identity["build"],
-                        "build_id": build_id,
-                    }))
-            doc = make_summary_doc(identity, build_id, failure, summ)
+            sig = failure_signature(failure)
+            if args.no_droid:
+                summ = PLACEHOLDER_SUMMARY
+            elif sig in sig_cache:
+                summ = sig_cache[sig]
+                logger.info("  [summary %d/%d] %s — reused (identical failure)", i, len(failures), tname)
+            else:
+                logger.info("  [summary %d/%d] %s", i, len(failures), tname)
+                summ = summarize_failure(failure, args.model, args.ignore_droid_failure, meta={
+                    "name": identity["name"], "os": identity["os"],
+                    "component": identity["component"], "build": identity["build"],
+                    "build_id": build_id,
+                })
+                sig_cache[sig] = summ
+                n_calls += 1
+            doc = make_summary_doc(identity, build_id, failure, summ, sig)
             summary_docs.append(doc)
             if store:
-                store.upsert_summary(key_summary(identity["name"], build_id, tname), doc)
+                store.upsert_summary(key_summary(identity["name"], build_id, tname, sig), doc)
+        if not args.no_droid:
+            logger.info("Tier-1: %d droid call(s) for %d failure(s) (%d saved by dedup)",
+                        n_calls, len(failures), len(failures) - n_calls)
 
         # ---- gather context for Tier 2 ----
         related, history, trend, existing = list(summary_docs), [], [], None
@@ -195,9 +218,12 @@ def main():
             trend   = store.job_trend(identity["name"])
             existing = store.get_analysis(
                 key_analysis(identity["name"], identity["build"]))
-        # ensure the just-computed summaries are represented even before they're queryable
-        seen = {(d.get("test_name"), d.get("build_id")) for d in related}
-        related += [d for d in summary_docs if (d.get("test_name"), d.get("build_id")) not in seen]
+        # ensure the just-computed summaries are represented even before they're queryable.
+        # Key on (test_name, build_id, sig) so distinct parametrized failures of the same
+        # method are all kept, not collapsed to one.
+        seen = {(d.get("test_name"), d.get("build_id"), d.get("sig")) for d in related}
+        related += [d for d in summary_docs
+                    if (d.get("test_name"), d.get("build_id"), d.get("sig")) not in seen]
 
         # ---- Tier 2: analysis doc ----
         now_iso = datetime.now(timezone.utc).isoformat()
