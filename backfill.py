@@ -247,6 +247,10 @@ def main():
     ap.add_argument("--version", required=True, help="e.g. 8.1.0")
     ap.add_argument("--builds", type=int, default=10, help="how many most-recent builds (default 10)")
     ap.add_argument("--build-list", help="explicit comma-separated builds (overrides --builds)")
+    ap.add_argument("--component", help="only analyze these component(s), comma-separated "
+                    "(e.g. EVENTING,FTS) — case-insensitive, matches the greenboard display "
+                    "component/gb_label. Default: all components. Useful to spend a limited token "
+                    "budget on COMPLETE coverage of a few components instead of thin coverage of all.")
     ap.add_argument("--skip-existing", action="store_true", help="skip (job,build) already analyzed")
     ap.add_argument("--dry-run", action="store_true", help="print the plan; trigger nothing")
     ap.add_argument("--ignore-droid-failure", action="store_true",
@@ -285,6 +289,12 @@ def main():
     builds = sorted(builds, key=build_sort_key)
     logger.info("Target builds (ascending): %s", builds)
 
+    # --- optional component filter ---
+    comp_filter = None
+    if args.component:
+        comp_filter = {c.strip().upper() for c in args.component.split(",") if c.strip()}
+        logger.info("Component filter: %s", sorted(comp_filter))
+
     jenkins = None
     if not args.dry_run:
         jenkins = Jenkins(args.jenkins_url, args.jenkins_user, args.jenkins_token, args.runner_job)
@@ -296,6 +306,13 @@ def main():
             logger.warning("No greenboard doc for %s_server — skipping", build)
             continue
         runs = enumerate_failing_runs(doc, build)
+
+        # component filter: keep only runs in the requested component(s)
+        if comp_filter:
+            before = len(runs)
+            runs = [r for r in runs if (r.get("component") or "").upper() in comp_filter]
+            logger.info("Build %s: component filter %s kept %d/%d run(s)",
+                        build, sorted(comp_filter), len(runs), before)
 
         # skip-existing: drop runs whose (job,build) already has an analysis doc
         if args.skip_existing and runs:
