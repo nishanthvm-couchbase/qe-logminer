@@ -114,9 +114,13 @@ class Jenkins:
 
     def trigger(self, params: dict):
         """Trigger a runner build; return the queue-item URL so we can track its result."""
+        # allow_redirects=False: buildWithParameters returns 201/302 with a
+        # Location header pointing at the queue item. If we let requests follow
+        # it, the GET lands on /queue and 404s — masking a successful trigger.
         r = self.s.post(f"{self.base}/job/{self.runner}/buildWithParameters",
-                        params=params, headers=self._crumb, timeout=30)
-        if r.status_code not in (200, 201):
+                        params=params, headers=self._crumb, timeout=30,
+                        allow_redirects=False)
+        if r.status_code not in (200, 201, 302, 303):
             raise RuntimeError(f"trigger HTTP {r.status_code}: {r.text[:200]}")
         return r.headers.get("Location")     # .../queue/item/<id>/
 
