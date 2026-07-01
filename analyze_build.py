@@ -45,6 +45,15 @@ PLACEHOLDER_SUMMARY = {
     "summary": "(droid skipped)", "category": "unknown",
     "root_cause": "", "suggested_fix": "", "confidence": "low",
 }
+CAPPED_SUMMARY = {
+    "summary": "(not analyzed — per-job failure cap reached)", "category": "unknown",
+    "root_cause": "", "suggested_fix": "", "confidence": "low", "capped": True,
+}
+# Token guardrail: summarize at most this many UNIQUE failures per job with droid.
+# Beyond it, failures are still recorded (so counts stay correct) but not sent to
+# droid. Protects a shared token budget from a single heavily-failing job (e.g. a
+# job with 40 failures would otherwise be ~40 droid calls). 0 = no cap.
+MAX_FAILURES_PER_JOB = int(os.environ.get("DROID_MAX_FAILURES_PER_JOB", "5"))
 
 
 def _jenkins_auth():
@@ -184,6 +193,7 @@ def main():
         summary_docs = []
         sig_cache = {}
         n_calls = 0
+        n_capped = 0
         for i, failure in enumerate(failures, 1):
             tname = failure.get("test_name", "unknown_test")
             sig = failure_signature(failure)
@@ -192,6 +202,12 @@ def main():
             elif sig in sig_cache:
                 summ = sig_cache[sig]
                 logger.info("  [summary %d/%d] %s — reused (identical failure)", i, len(failures), tname)
+            elif MAX_FAILURES_PER_JOB > 0 and n_calls >= MAX_FAILURES_PER_JOB:
+                # per-job cap reached — record the failure but spend no droid tokens
+                summ = CAPPED_SUMMARY
+                sig_cache[sig] = summ           # treat as seen so repeats also stay free
+                n_capped += 1
+                logger.info("  [summary %d/%d] %s — CAPPED (>%d unique failures)", i, len(failures), tname, MAX_FAILURES_PER_JOB)
             else:
                 logger.info("  [summary %d/%d] %s", i, len(failures), tname)
                 summ = summarize_failure(failure, args.model, args.ignore_droid_failure, meta={
@@ -206,8 +222,8 @@ def main():
             if store:
                 store.upsert_summary(key_summary(identity["name"], build_id, tname, sig), doc)
         if not args.no_droid:
-            logger.info("Tier-1: %d droid call(s) for %d failure(s) (%d saved by dedup)",
-                        n_calls, len(failures), len(failures) - n_calls)
+            logger.info("Tier-1: %d droid call(s) for %d failure(s) (%d saved by dedup, %d capped)",
+                        n_calls, len(failures), len(failures) - n_calls - n_capped, n_capped)
 
         # ---- gather context for Tier 2 ----
         related, history, trend, existing = list(summary_docs), [], [], None
