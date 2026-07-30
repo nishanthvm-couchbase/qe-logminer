@@ -32,11 +32,15 @@ _cfg = {
     "cb_bucket":     os.environ.get("TOKEN_USAGE_BUCKET", "test_analysis"),
     "cb_scope":      os.environ.get("TOKEN_USAGE_SCOPE", "_default"),
     "cb_collection": os.environ.get("TOKEN_USAGE_COLLECTION", "token_usage"),
+    "metrics_collection": os.environ.get("ANALYSIS_METRICS_COLLECTION", "analysis_metrics"),
+    "metrics_jsonl":      os.environ.get("ANALYSIS_METRICS_LOG", "analysis_metrics.jsonl"),
     "cb_user":       os.environ.get("CB_USER", "Administrator"),
     "cb_pass":       os.environ.get("CB_PASS", "esabhcuoc"),
 }
-_col = None
-_col_tried = False
+_cluster = None
+_cluster_tried = False
+_cols: Dict[str, Any] = {}
+_totals = {"calls": 0, "input_tokens": 0, "output_tokens": 0}   # cumulative this process (≈ this run)
 _lock = threading.Lock()
 
 
@@ -47,34 +51,75 @@ def configure(**kw) -> None:
             _cfg[k] = v
 
 
-def _collection():
-    global _col, _col_tried
-    if _col is not None or _col_tried:
-        return _col
-    _col_tried = True
+def _get_cluster():
+    global _cluster, _cluster_tried
+    if _cluster is not None or _cluster_tried:
+        return _cluster
+    _cluster_tried = True
     if not (_cfg["cb_enabled"] and _cfg["cb_host"]):
         return None
-    b, s, c = _cfg["cb_bucket"], _cfg["cb_scope"], _cfg["cb_collection"]
     try:
         from couchbase.cluster import Cluster
         from couchbase.options import ClusterOptions
         from couchbase.auth import PasswordAuthenticator
-        cl = Cluster("couchbase://%s" % _cfg["cb_host"],
-                     ClusterOptions(PasswordAuthenticator(_cfg["cb_user"], _cfg["cb_pass"])))
-        # Best-effort: make sure the dedicated collection (+ a primary index for the
-        # dashboard's aggregate queries) exists. Idempotent; ignore if it already does.
-        for stmt in (f"CREATE COLLECTION `{b}`.`{s}`.`{c}` IF NOT EXISTS",
-                     f"CREATE PRIMARY INDEX IF NOT EXISTS ON `{b}`.`{s}`.`{c}`"):
+        _cluster = Cluster("couchbase://%s" % _cfg["cb_host"],
+                           ClusterOptions(PasswordAuthenticator(_cfg["cb_user"], _cfg["cb_pass"])))
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write("  token_usage: CB connect failed (%s) — JSONL only\n" % e)
+        _cluster = None
+    return _cluster
+
+
+def _get_collection(coll_name):
+    """Cached handle to bucket/scope/<coll_name>; creates it + a primary index
+    idempotently. Returns None if CB is unavailable (callers degrade to JSONL)."""
+    if coll_name in _cols:
+        return _cols[coll_name]
+    cl = _get_cluster()
+    if cl is None:
+        _cols[coll_name] = None
+        return None
+    b, s = _cfg["cb_bucket"], _cfg["cb_scope"]
+    try:
+        for stmt in (f"CREATE COLLECTION `{b}`.`{s}`.`{coll_name}` IF NOT EXISTS",
+                     f"CREATE PRIMARY INDEX IF NOT EXISTS ON `{b}`.`{s}`.`{coll_name}`"):
             try:
                 for _ in cl.query(stmt):
                     pass
             except Exception:
                 pass
-        _col = cl.bucket(b).scope(s).collection(c)
+        _cols[coll_name] = cl.bucket(b).scope(s).collection(coll_name)
     except Exception as e:  # noqa: BLE001
-        sys.stderr.write("  token_usage: CB connect failed (%s) — JSONL only\n" % e)
-        _col = None
-    return _col
+        sys.stderr.write("  token_usage: collection %s failed (%s)\n" % (coll_name, e))
+        _cols[coll_name] = None
+    return _cols[coll_name]
+
+
+def _collection():
+    return _get_collection(_cfg["cb_collection"])
+
+
+def totals() -> Dict[str, int]:
+    """Cumulative droid token spend recorded this process (≈ this analyze_build run)."""
+    with _lock:
+        return dict(_totals)
+
+
+def record_metrics(key: str, doc: Dict[str, Any]) -> None:
+    """Persist one run-level metrics doc (dedup/complexity/token counters) to a
+    JSONL file AND the `analysis_metrics` collection. Best-effort, never raises."""
+    doc = {**doc, "ts": datetime.now(timezone.utc).isoformat()}
+    try:
+        with _lock, open(_cfg["metrics_jsonl"], "a", encoding="utf-8") as f:
+            f.write(json.dumps(doc) + "\n")
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write("  metrics: jsonl write failed (%s)\n" % e)
+    col = _get_collection(_cfg["metrics_collection"])
+    if col is not None:
+        try:
+            col.upsert(key, doc)
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write("  metrics: CB upsert failed (%s)\n" % e)
 
 
 def record(meta: Optional[Dict[str, Any]], usage: Optional[Dict[str, Any]],
@@ -83,6 +128,10 @@ def record(meta: Optional[Dict[str, Any]], usage: Optional[Dict[str, Any]],
     usage = usage or {}
     it = usage.get("input_tokens") or 0
     ot = usage.get("output_tokens") or 0
+    with _lock:
+        _totals["calls"] += 1
+        _totals["input_tokens"] += it
+        _totals["output_tokens"] += ot
     # Only the details needed to visualise token spend by job / component over time.
     ev = {
         "ts":            datetime.now(timezone.utc).isoformat(),

@@ -124,6 +124,22 @@ class AnalysisStore:
         )
         return self._query(stmt, job=job_name, build=build)
 
+    def candidate_embeddings(self, component: str, model: str,
+                             limit: int = 500) -> List[Dict[str, Any]]:
+        """Recent Tier-1 summaries for a component that carry an embedding of the
+        SAME model (vectors from different models aren't comparable). Used for
+        near-duplicate reuse — the caller cosine-matches against these. Best-effort:
+        returns [] if the supporting index is missing (feature just no-ops)."""
+        stmt = (
+            f"SELECT a.summary, a.category, a.root_cause, a.suggested_fix, "
+            f"a.confidence, a.complexity, a.embedding, a.test_name, a.`build`, a.build_id "
+            f"FROM `{ANALYSIS_BUCKET}` a "
+            f"WHERE a.type = 'test_failure_analysis' AND a.component = $comp "
+            f"AND a.embedding_model = $model AND a.embedding IS NOT MISSING "
+            f"ORDER BY a.build_id DESC LIMIT {int(limit)}"
+        )
+        return self._query(stmt, comp=component, model=model)
+
     def test_failure_history(self, job_name: str, limit: int = 400) -> List[Dict[str, Any]]:
         """Per-test failure records for this job across ALL builds (for first-seen /
         recurring / streak signals). Returns {test_name, build, build_id, category}."""

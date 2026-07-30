@@ -98,13 +98,19 @@ def failure_signature(failure):
       • a genuinely different error/exception          -> different trace -> own call
     Falls back to the normalized error window only when no traceback was captured.
     """
+    return hashlib.md5(signature_basis(failure).encode("utf-8", "ignore")).hexdigest()
+
+
+def signature_basis(failure):
+    """The normalized text the signature hashes — test_name + params + traceback,
+    volatile tokens stripped. Also the basis for the near-dup embedding, so an exact
+    repeat embeds identically and a near-identical failure lands close to it."""
     tn = (failure.get("test_name") or "").strip()
     params = _normalize(failure.get("params") or "")
     tb = _normalize(failure.get("traceback") or "")
     if not tb:                                   # no traceback parsed — best-effort fallback
         tb = _normalize(failure.get("error_lines") or "")[:4000]
-    raw = tn + "||" + params + "||" + tb
-    return hashlib.md5(raw.encode("utf-8", "ignore")).hexdigest()
+    return tn + "||" + params + "||" + tb
 
 VALID_CATEGORIES = {
     "product_bug", "test_bug", "infra", "environment", "timeout", "unknown",
@@ -129,6 +135,10 @@ nothing before or after it — with EXACTLY these keys:
   "root_cause":     the most likely underlying cause, concise.
   "suggested_fix":  a concrete next step or fix.
   "confidence":     "high", "medium", or "low".
+  "complexity":     "high" or "low". "high" ONLY if diagnosing this failure genuinely \
+required non-obvious, multi-factor reasoning (interacting causes, subtle state, \
+cross-log correlation). "low" for straightforward/mechanical failures (plain \
+assertion mismatch, timeout, missing resource, obvious ssh/infra/build error).
 
 Guidance on category:
   product_bug  - the server/product misbehaved (crash, wrong result, rebalance failure)
@@ -219,12 +229,16 @@ def normalize_summary(obj):
     confidence = str(obj.get("confidence", "low")).strip().lower()
     if confidence not in ("high", "medium", "low"):
         confidence = "low"
+    complexity = str(obj.get("complexity", "low")).strip().lower()
+    if complexity not in ("high", "low"):
+        complexity = "low"
     return {
         "summary": str(obj.get("summary", "")).strip() or "(no summary produced)",
         "category": category,
         "root_cause": str(obj.get("root_cause", "")).strip(),
         "suggested_fix": str(obj.get("suggested_fix", "")).strip(),
         "confidence": confidence,
+        "complexity": complexity,
     }
 
 
@@ -315,7 +329,7 @@ def run_droid(prompt, model, auto="low", meta=None):
     return False, None
 
 
-def summarize_failure(failed_test, model, ignore_failure=False, meta=None):
+def summarize_failure(failed_test, model, ignore_failure=False, meta=None, context_summary=None):
     """Run droid for one failed test and return the normalized summary dict.
 
     On droid failure: raise DroidError (default) so the caller can STOP — this
@@ -323,6 +337,9 @@ def summarize_failure(failed_test, model, ignore_failure=False, meta=None):
     droid is out of tokens. With ignore_failure=True, emit a placeholder instead.
 
     `meta` (job/os/component/build context) is forwarded for token-usage tracking.
+    `context_summary`: a prior summary of a near-identical failure (from vector
+    dedup). When given, it's injected as a strong hint so droid can confirm/refine
+    it instead of reasoning from scratch — used for HIGH-complexity near-dups.
     """
     prompt = PROMPT_TEMPLATE.format(
         categories=sorted(VALID_CATEGORIES),
@@ -331,6 +348,15 @@ def summarize_failure(failed_test, model, ignore_failure=False, meta=None):
         traceback=failed_test.get("traceback", "") or "(no traceback captured)",
         error_lines=failed_test.get("error_lines", "") or "(no error lines captured)",
     )
+    if context_summary:
+        prompt += (
+            "\n\nNOTE — a very similar failure was previously analyzed:\n"
+            f"  summary:    {context_summary.get('summary', '')}\n"
+            f"  root_cause: {context_summary.get('root_cause', '')}\n"
+            f"  category:   {context_summary.get('category', '')}\n"
+            "Treat it as a strong hint: confirm it if it fits this failure, or correct it "
+            "if this one genuinely differs. Still return the full JSON object."
+        )
     call_meta = {**(meta or {}), "phase": "summarize",
                  "test_name": failed_test.get("test_name", "unknown_test")}
     ok, obj = run_droid(prompt, model, meta=call_meta)
