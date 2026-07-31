@@ -35,7 +35,8 @@ import requests
 
 from parse_console_log import fetch_content, build_result
 from job_identity import identity_from_actions
-from summarize_failures import summarize_failure, failure_signature, signature_basis, DroidError
+from summarize_failures import (summarize_failure, failure_signature, signature_basis,
+                                 estimate_prompt_tokens, DroidError)
 try:
     import embeddings
 except Exception:
@@ -65,6 +66,18 @@ MAX_FAILURES_PER_JOB = int(os.environ.get("DROID_MAX_FAILURES_PER_JOB", "5"))
 # VECTOR_SIM_THRESHOLD of an already-summarized one REUSES that summary — no droid call.
 VECTOR_DEDUP         = os.environ.get("VECTOR_DEDUP", "0") == "1"
 VECTOR_SIM_THRESHOLD = float(os.environ.get("VECTOR_SIM_THRESHOLD", "0.93"))
+# Lenient (worst-case) token estimate for a droid call we AVOIDED via reuse — so the
+# reported savings never over-state real spend. chars/3.5 input + a fixed output guess.
+EST_CHARS_PER_TOKEN = float(os.environ.get("EST_CHARS_PER_TOKEN", "3.5"))
+EST_OUTPUT_TOKENS   = int(os.environ.get("EST_OUTPUT_TOKENS", "300"))
+
+
+def _est_saved(failure):
+    """Approx tokens a reuse saved = the summarize prompt we'd have sent + a small output."""
+    try:
+        return estimate_prompt_tokens(failure, EST_CHARS_PER_TOKEN) + EST_OUTPUT_TOKENS
+    except Exception:
+        return 0
 
 
 def _jenkins_auth():
@@ -214,6 +227,7 @@ def main():
         n_exact = 0        # identical-signature reuses (0 tokens)
         n_vector = 0       # low-complexity near-dups reused directly (0 tokens)
         n_vector_aug = 0   # high-complexity near-dups → droid call WITH prior context
+        tokens_saved = 0   # approx droid tokens avoided by reuse (lenient estimate)
 
         # Near-dup dedup: load recent same-component summaries carrying an embedding of
         # our model; a new failure within VECTOR_SIM_THRESHOLD of one reuses its summary
@@ -246,7 +260,9 @@ def main():
             elif sig in sig_cache:
                 summ = sig_cache[sig]
                 n_exact += 1
-                logger.info("  [summary %d/%d] %s — reused (identical failure)", i, len(failures), tname)
+                saved = _est_saved(failure); tokens_saved += saved
+                logger.info("  [summary %d/%d] %s — reused (identical failure, ~%d tok saved)",
+                            i, len(failures), tname, saved)
             else:
                 vec_cand, vec_sim = (embeddings.best_match(emb, vec_candidates) if (vec_on and emb) else (None, -1.0))
                 near      = vec_cand is not None and vec_sim >= VECTOR_SIM_THRESHOLD
@@ -258,8 +274,9 @@ def main():
                     summ = {k: vec_cand.get(k, "") for k in REUSE_FIELDS}
                     summ["reused_via"] = "vector"; summ["reuse_sim"] = round(vec_sim, 4)
                     sig_cache[sig] = summ; n_vector += 1
-                    logger.info("  [summary %d/%d] %s — reused via vector (sim=%.3f, low-complexity, ~%s)",
-                                i, len(failures), tname, vec_sim, vec_cand.get("test_name"))
+                    saved = _est_saved(failure); tokens_saved += saved
+                    logger.info("  [summary %d/%d] %s — reused via vector (sim=%.3f, low-complexity, ~%d tok saved, ~%s)",
+                                i, len(failures), tname, vec_sim, saved, vec_cand.get("test_name"))
                 elif near_high and under_cap:
                     # high-complexity near-dup → re-analyze with droid, primed by the prior summary
                     logger.info("  [summary %d/%d] %s — near-dup HIGH complexity (sim=%.3f) → droid + context",
@@ -278,7 +295,9 @@ def main():
                     summ = {k: vec_cand.get(k, "") for k in REUSE_FIELDS}
                     summ["reused_via"] = "vector_capped"; summ["reuse_sim"] = round(vec_sim, 4)
                     sig_cache[sig] = summ; n_vector += 1
-                    logger.info("  [summary %d/%d] %s — CAP reached, reused near-dup (sim=%.3f)", i, len(failures), tname, vec_sim)
+                    saved = _est_saved(failure); tokens_saved += saved
+                    logger.info("  [summary %d/%d] %s — CAP reached, reused near-dup (sim=%.3f, ~%d tok saved)",
+                                i, len(failures), tname, vec_sim, saved)
                 else:
                     # cap reached, no near-dup → record but spend nothing
                     summ = CAPPED_SUMMARY; sig_cache[sig] = summ; n_capped += 1
@@ -367,13 +386,15 @@ def main():
             "tokens_input":          tok.get("input_tokens", 0),
             "tokens_output":         tok.get("output_tokens", 0),
             "tokens_total":          tok.get("input_tokens", 0) + tok.get("output_tokens", 0),
+            "tokens_saved_est":      tokens_saved,       # ~droid tokens avoided by reuse (lenient)
         }
         if store:
             _tu.record_metrics("arun_" + akey.split("_", 1)[1] + f"_{build_id}", run_metrics)
         logger.info("Run metrics: droid=%d (fresh=%d, aug=%d) | exact=%d vector-reuse=%d capped=%d | "
-                    "pushed high/low=%d/%d | candidates high/low=%d/%d | tokens=%d",
+                    "pushed high/low=%d/%d | candidates high/low=%d/%d | tokens=%d | ~tokens saved=%d",
                     n_calls, n_calls - n_vector_aug, n_vector_aug, n_exact, n_vector, n_capped,
-                    pushed_high, pushed_low, cand_high, cand_low, run_metrics["tokens_total"])
+                    pushed_high, pushed_low, cand_high, cand_low,
+                    run_metrics["tokens_total"], tokens_saved)
     except Exception as _mexc:  # metrics must never fail the run
         logger.warning("metrics record failed (non-fatal): %s", _mexc)
     return 0

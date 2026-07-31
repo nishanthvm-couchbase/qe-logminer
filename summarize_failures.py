@@ -112,6 +112,21 @@ def signature_basis(failure):
         tb = _normalize(failure.get("error_lines") or "")[:4000]
     return tn + "||" + params + "||" + tb
 
+
+def estimate_prompt_tokens(failed_test, chars_per_token=3.5):
+    """Rough INPUT-token estimate for the summarize prompt we WOULD have sent for this
+    failure — the full template + evidence. Used to report tokens SAVED when a droid
+    call is avoided (dedup/vector reuse). Deliberately lenient (chars/3.5) so savings
+    are a worst-case-ish figure, never an over-count of real spend."""
+    prompt = PROMPT_TEMPLATE.format(
+        categories=sorted(VALID_CATEGORIES),
+        test_name=failed_test.get("test_name", ""),
+        params=failed_test.get("params", ""),
+        traceback=failed_test.get("traceback", "") or "(no traceback captured)",
+        error_lines=failed_test.get("error_lines", "") or "(no error lines captured)",
+    )
+    return int(len(prompt) / max(chars_per_token, 1.0)) + 1
+
 VALID_CATEGORIES = {
     "product_bug", "test_bug", "infra", "environment", "timeout", "unknown",
 }
